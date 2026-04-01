@@ -1,0 +1,15 @@
+"""
+Compatibility exports.
+
+You can import the adapter classes from here if you want to build a thin
+wrapper around the existing `download_tiles.py` entrypoint.
+"""
+
+from download_imagery import (
+    GoogleEarthLocalAdapter,
+    ImageryAdapter,
+    TileJob,
+    WMSImageryAdapter,
+    build_adapter,
+    download_grid,
+)

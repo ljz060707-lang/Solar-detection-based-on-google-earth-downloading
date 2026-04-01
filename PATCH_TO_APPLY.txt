@@ -1,0 +1,373 @@
+from __future__ import annotations
+
+"""
+Unified imagery ingress for SA_Solar.
+
+This file adds a pluggable adapter layer so the workflow can ingest either:
+1) the existing WMS source, or
+2) locally exported Google Earth imagery that you already have rights to use.
+
+The Google Earth adapter is intentionally designed for local, georeferenced
+exports (GeoTIFF, or image files with world files / sidecar georeferencing).
+It does not automate scraping or bypass any platform restrictions.
+"""
+
+from dataclasses import dataclass
+from io import BytesIO
+from pathlib import Path
+from abc import ABC, abstractmethod
+import argparse
+import shutil
+import sys
+import time
+from typing import Iterable, Optional
+
+import numpy as np
+import rasterio
+from rasterio.crs import CRS
+from rasterio.enums import Resampling
+from rasterio.transform import from_bounds
+from rasterio.warp import reproject
+import requests
+from PIL import Image
+
+# Make repo root importable, matching the style of the existing scripts.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
+from core.grid_utils import get_grid_spec, get_tile_bounds, normalize_grid_id, TILES_ROOT
+
+
+EPSG_4326 = CRS.from_epsg(4326)
+
+
+@dataclass(frozen=True)
+class TileJob:
+    grid_id: str
+    col: int
+    row: int
+
+
+class ImageryAdapter(ABC):
+    """Abstract adapter for a tile-producing imagery source."""
+
+    name: str = "base"
+
+    @abstractmethod
+    def fetch_tile(self, spec, job: TileJob, out_path: Path) -> None:
+        """Create one tile at `out_path`."""
+
+
+class WMSImageryAdapter(ImageryAdapter):
+    """Current default path: WMS download + GeoTIFF georeferencing."""
+
+    name = "wms"
+
+    def __init__(
+        self,
+        wms_url: str,
+        wms_layer: str,
+        wms_format: str = "image/jpeg",
+        timeout: int = 300,
+    ) -> None:
+        self.wms_url = wms_url
+        self.wms_layer = wms_layer
+        self.wms_format = wms_format
+        self.timeout = timeout
+
+    def fetch_tile(self, spec, job: TileJob, out_path: Path) -> None:
+        txmin, tymin, txmax, tymax = get_tile_bounds(spec, job.col, job.row)
+
+        params = {
+            "service": "WMS",
+            "version": "1.1.1",
+            "request": "GetMap",
+            "layers": self.wms_layer,
+            "srs": "EPSG:4326",
+            "bbox": f"{txmin},{tymin},{txmax},{tymax}",
+            "width": spec.pixel_size,
+            "height": spec.pixel_size,
+            "format": self.wms_format,
+            "styles": "",
+        }
+
+        response = requests.get(self.wms_url, params=params, timeout=self.timeout)
+        response.raise_for_status()
+
+        content_type = response.headers.get("Content-Type", "")
+        if "xml" in content_type.lower() or "html" in content_type.lower():
+            raise RuntimeError(f"WMS returned a non-image response: {content_type}")
+
+        img = Image.open(BytesIO(response.content)).convert("RGB")
+        data = np.asarray(img)
+        data = np.transpose(data, (2, 0, 1))  # HWC -> CHW
+
+        transform = from_bounds(txmin, tymin, txmax, tymax, spec.pixel_size, spec.pixel_size)
+        profile = {
+            "driver": "GTiff",
+            "dtype": data.dtype,
+            "width": data.shape[2],
+            "height": data.shape[1],
+            "count": data.shape[0],
+            "crs": "EPSG:4326",
+            "transform": transform,
+            "compress": "deflate",
+            "tiled": True,
+        }
+
+        with rasterio.open(str(out_path), "w", **profile) as dst:
+            dst.write(data)
+
+
+class GoogleEarthLocalAdapter(ImageryAdapter):
+    """
+    Local Google Earth adapter.
+
+    Expected use:
+    - Place legally obtained Google Earth exports in `source_dir`.
+    - The source can be GeoTIFF or image files with world files / sidecar metadata.
+    - Files are normalized into the existing `tiles/<GridID>/..._geo.tif` layout.
+
+    This adapter intentionally does not automate Google Earth downloading.
+    """
+
+    name = "google_earth_local"
+
+    def __init__(
+        self,
+        source_dir: Path,
+        preview_dir: Optional[Path] = None,
+        index_csv: Optional[Path] = None,
+    ) -> None:
+        self.source_dir = Path(source_dir)
+        self.preview_dir = Path(preview_dir) if preview_dir else None
+        self.index_csv = Path(index_csv) if index_csv else None
+
+    def _tile_id(self, job: TileJob) -> str:
+        return f"{job.grid_id}_{job.col}_{job.row}"
+
+    def _candidate_paths(self, job: TileJob) -> list[Path]:
+        tile_id = self._tile_id(job)
+        patterns = [
+            f"{tile_id}*.tif",
+            f"{tile_id}*.tiff",
+            f"{tile_id}*.png",
+            f"{tile_id}*.jpg",
+            f"{tile_id}*.jpeg",
+        ]
+        found: list[Path] = []
+        for pattern in patterns:
+            found.extend(self.source_dir.rglob(pattern))
+        # Sort by shortest path first so exact matches win.
+        found = sorted({p.resolve() for p in found}, key=lambda p: (len(str(p)), str(p)))
+        return found
+
+    def _resolve_source(self, job: TileJob) -> Path:
+        if self.index_csv and self.index_csv.exists():
+            # Optional CSV map: tile_id,source_path
+            import csv
+            with self.index_csv.open("r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row.get("tile_id") == self._tile_id(job):
+                        candidate = Path(row["source_path"])
+                        if not candidate.is_absolute():
+                            candidate = self.source_dir / candidate
+                        if candidate.exists():
+                            return candidate
+
+        candidates = self._candidate_paths(job)
+        if candidates:
+            return candidates[0]
+
+        raise FileNotFoundError(
+            f"Could not find a local Google Earth export for tile {self._tile_id(job)} "
+            f"under {self.source_dir}"
+        )
+
+    def _write_preview(self, out_path: Path) -> None:
+        if self.preview_dir is None:
+            return
+        self.preview_dir.mkdir(parents=True, exist_ok=True)
+        preview_path = self.preview_dir / (out_path.stem + ".png")
+
+        with rasterio.open(str(out_path)) as ds:
+            arr = ds.read()
+            if arr.ndim == 3:
+                if arr.shape[0] >= 3:
+                    rgb = np.transpose(arr[:3], (1, 2, 0))
+                else:
+                    rgb = np.repeat(np.transpose(arr, (1, 2, 0)), 3, axis=2)
+            else:
+                rgb = np.repeat(arr[:, :, None], 3, axis=2)
+
+            rgb = rgb.astype(np.float32)
+            lo = np.nanpercentile(rgb, 2)
+            hi = np.nanpercentile(rgb, 98)
+            if hi <= lo:
+                lo, hi = float(np.nanmin(rgb)), float(np.nanmax(rgb) + 1.0)
+            rgb = np.clip((rgb - lo) / (hi - lo + 1e-6), 0, 1)
+            rgb = (rgb * 255).astype(np.uint8)
+
+        Image.fromarray(rgb).save(preview_path)
+
+    def fetch_tile(self, spec, job: TileJob, out_path: Path) -> None:
+        src_path = self._resolve_source(job)
+
+        txmin, tymin, txmax, tymax = get_tile_bounds(spec, job.col, job.row)
+        dst_transform = from_bounds(txmin, tymin, txmax, tymax, spec.pixel_size, spec.pixel_size)
+
+        with rasterio.open(str(src_path)) as src:
+            if src.crs is None or src.transform is None:
+                raise RuntimeError(
+                    f"Source file has no CRS/transform: {src_path}. "
+                    "Use a georeferenced export or provide a world file."
+                )
+
+            # Always normalize to the repository's GeoTIFF tile layout and EPSG:4326.
+            # 3-channel RGB output keeps the downstream workflow compatible.
+            band_map = [1, 2, 3]
+            if src.count == 1:
+                band_map = [1, 1, 1]
+            elif src.count == 2:
+                band_map = [1, 2, 2]
+            else:
+                band_map = [1, 2, 3]
+
+            dst_dtype = src.dtypes[0]
+            dst = np.zeros((3, spec.pixel_size, spec.pixel_size), dtype=dst_dtype)
+
+            for out_band_idx, src_band_idx in enumerate(band_map, start=1):
+                reproject(
+                    source=rasterio.band(src, src_band_idx),
+                    destination=dst[out_band_idx - 1],
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    dst_transform=dst_transform,
+                    dst_crs=EPSG_4326,
+                    resampling=Resampling.bilinear,
+                )
+
+            profile = {
+                "driver": "GTiff",
+                "dtype": dst_dtype,
+                "width": spec.pixel_size,
+                "height": spec.pixel_size,
+                "count": 3,
+                "crs": "EPSG:4326",
+                "transform": dst_transform,
+                "compress": "deflate",
+                "tiled": True,
+            }
+
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with rasterio.open(str(out_path), "w", **profile) as dst_ds:
+                dst_ds.write(dst)
+
+        self._write_preview(out_path)
+
+
+def build_adapter(
+    source: str,
+    source_dir: Optional[Path] = None,
+    preview_dir: Optional[Path] = None,
+    index_csv: Optional[Path] = None,
+) -> ImageryAdapter:
+    source = source.lower().strip()
+
+    if source == "wms":
+        # Defaults mirror the existing WMS download behavior described in the repo.
+        return WMSImageryAdapter(
+            wms_url="https://cityimg.capetown.gov.za/erdas-iws/ogc/wms/GeoSpatial Datasets",
+            wms_layer="Aerial Imagery_Aerial Imagery 2025Jan",
+            wms_format="image/jpeg",
+            timeout=300,
+        )
+
+    if source in {"google_earth", "google_earth_local", "ge"}:
+        if source_dir is None:
+            raise ValueError("--source-dir is required when --source google_earth_local")
+        return GoogleEarthLocalAdapter(source_dir=source_dir, preview_dir=preview_dir, index_csv=index_csv)
+
+    raise ValueError(f"Unsupported imagery source: {source}")
+
+
+def download_grid(
+    grid_id: str,
+    adapter: ImageryAdapter,
+    dry_run: bool = False,
+    tile_mask: Optional[set[tuple[int, int]]] = None,
+) -> None:
+    grid_id = normalize_grid_id(grid_id)
+    spec = get_grid_spec(grid_id)
+    tiles_dir = TILES_ROOT / grid_id
+    tiles_dir.mkdir(parents=True, exist_ok=True)
+
+    total_all = spec.n_cols * spec.n_rows
+    if tile_mask is not None:
+        tiles_to_download = sorted(tile_mask)
+        total = len(tiles_to_download)
+        mode = f"masked ({total}/{total_all} tiles)"
+    else:
+        tiles_to_download = [(col, row) for col in range(spec.n_cols) for row in range(spec.n_rows)]
+        total = total_all
+        mode = f"all ({total} tiles)"
+
+    print(f"Grid: {grid_id}")
+    print(f"Bounds: ({spec.xmin:.6f}, {spec.ymin:.6f}) -> ({spec.xmax:.6f}, {spec.ymax:.6f})")
+    print(f"Tiles: {spec.n_cols} cols x {spec.n_rows} rows = {total_all}")
+    print(f"Download: {mode}")
+    print(f"Source: {adapter.name}")
+    print(f"Output: {tiles_dir}")
+
+    if dry_run:
+        return
+
+    downloaded = 0
+    skipped = 0
+    errors = 0
+
+    for col, row in tiles_to_download:
+        tile_name = f"{grid_id}_{col}_{row}_geo.tif"
+        out_path = tiles_dir / tile_name
+
+        if out_path.exists():
+            skipped += 1
+            continue
+
+        job = TileJob(grid_id=grid_id, col=col, row=row)
+        try:
+            adapter.fetch_tile(spec, job, out_path)
+            downloaded += 1
+            print(f" [{downloaded + skipped}/{total}] {tile_name}")
+        except Exception as e:
+            errors += 1
+            print(f" [ERROR] {tile_name}: {e}")
+            time.sleep(2)
+
+    print(f"\n[DONE] {grid_id}: downloaded={downloaded}, skipped={skipped}, errors={errors}")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Unified imagery ingress for SA_Solar")
+    p.add_argument("--grid-id", required=True, help="Grid identifier, e.g. G1190")
+    p.add_argument("--source", default="wms", choices=["wms", "google_earth_local", "google_earth", "ge"])
+    p.add_argument("--source-dir", type=Path, default=None, help="Folder containing local Google Earth exports")
+    p.add_argument("--preview-dir", type=Path, default=None, help="Optional folder for PNG previews")
+    p.add_argument("--index-csv", type=Path, default=None, help="Optional tile_id -> source_path mapping CSV")
+    p.add_argument("--dry-run", action="store_true")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    adapter = build_adapter(
+        source=args.source,
+        source_dir=args.source_dir,
+        preview_dir=args.preview_dir,
+        index_csv=args.index_csv,
+    )
+    download_grid(args.grid_id, adapter=adapter, dry_run=args.dry_run)
+
+
+if __name__ == "__main__":
+    main()
