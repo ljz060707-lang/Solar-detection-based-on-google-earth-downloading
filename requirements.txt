@@ -1,15 +1,7 @@
-geoai-py
-geopandas
-shapely
-scikit-learn
-matplotlib
-seaborn
-rasterio
-rasterstats
-osmnx
-requests
-torch
-torchvision
-huggingface_hub
-opencv-python-headless
-pycocotools
+# 创建虚拟环境（必做，避免冲突）
+conda create -n solar python=3.10 -y
+conda activate solar
+
+# 安装稳定依赖（修复rasterio/geopandas/torch报错）
+conda install -c conda-forge rasterio geopandas gdal shapely pycocotools -y
+pip install torch torchvision opencv-python pyyaml pillow tqdm
