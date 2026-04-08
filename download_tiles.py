@@ -166,6 +166,26 @@ def download_grid(grid_id: str, dry_run: bool = False, tile_mask: set | None = N
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="下载 Cape Town WMS 瓦片")
     parser.add_argument("--grid-id", required=True, help="目标 grid ID (e.g. G1189)")
+
+  # 在download_tiles.py中添加
+from gee_adapter import gee_download_tiles
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="imagery_sources.yaml")
+    args = parser.parse_args()
+    
+    config = load_config(args.config)
+    source_type = config["sources"]["type"]  # 在yaml中添加类型标识
+    
+    if source_type == "gee":
+        gee_download_tiles(config)
+    elif source_type == "google_earth":
+        # 原有Google Earth下载逻辑
+        pass
+    elif source_type == "wms":
+        # WMS下载逻辑
+        pass
     parser.add_argument("--dry", action="store_true", help="只打印 tile 信息")
     args = parser.parse_args()
     download_grid(args.grid_id, dry_run=args.dry)
