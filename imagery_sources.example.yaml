@@ -13,3 +13,15 @@ from download_imagery import (
     build_adapter,
     download_grid,
 )
+sources:
+  type: "gee"  # 切换到GEE源
+  google_earth:
+    zoom_level: 18
+    bbox: [118.76, 32.04, 118.80, 32.08]  # 南京鼓楼区示例
+    output_dir: "./tiles"
+    max_workers: 8
+    scale: 10  # GEE分辨率（米），10m适合屋顶细节
+    # GEE影像参数
+    collection: "COPERNICUS/S2_SR_HARMONIZED"  # Sentinel-2
+    date_range: ["2024-01-01", "2024-12-31"]
+    cloud_cover: 10  # 云量<10%
